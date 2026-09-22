@@ -43,10 +43,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-          - runner: macos-14
-            target: aarch64-apple-darwin
           - runner: macos-15-intel
             target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -111,10 +111,7 @@ jobs:
 
   draft-release:
     name: Attest and draft the release
-    # Only the candidate push drafts a release. A manual dispatch is a
-    # build-only dry run: it can be pointed at any branch to check that
-    # every target still compiles without touching releases.
-    if: github.event_name == 'push'
+    if: github.event_name != 'release'
     needs:
       - build-celld
     runs-on: ubuntu-22.04
@@ -141,8 +138,8 @@ jobs:
           for target in \
             x86_64-unknown-linux-gnu \
             aarch64-unknown-linux-gnu \
-            aarch64-apple-darwin \
-            x86_64-apple-darwin; do
+            x86_64-apple-darwin \
+            aarch64-apple-darwin; do
             test -f "celld-$target.gz"
           done
 
