@@ -344,10 +344,23 @@ select a different port:
 celld dev --port 3000
 ```
 
-Use `--host` to select the Worker listener interface:
+Use `--host` without a value to listen on every interface. celld then lists
+loopback and each IPv4 interface address, so a phone or another machine on the
+same network can open one of them:
 
 ```sh
-celld dev --host 0.0.0.0
+celld dev --host
+```
+
+```text
+  ready  http://127.0.0.1:9876
+         http://192.168.1.23:9876  en0
+```
+
+Use `--host IP` or `--host=IP` to select one interface instead:
+
+```sh
+celld dev --host 192.168.1.23
 ```
 
 A non-loopback IP exposes the Worker listener to the network. The internal

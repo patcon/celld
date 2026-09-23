@@ -141,12 +141,34 @@ impl Console {
         crate::note!("  {} {message}", self.paint(Color::Yellow.normal(), "●"));
     }
 
-    fn ready(&self, origin: &str) {
-        crate::note!(
-            "  {}  {}",
-            self.paint(Color::Green.bold(), "ready"),
-            self.paint(Color::Cyan.bold(), origin)
-        );
+    fn ready(&self, listener: SocketAddr) {
+        let origins = ready_origins(listener, &interface_addresses());
+        let width = origins
+            .iter()
+            .map(|ready| ready.origin.len())
+            .max()
+            .unwrap_or(0);
+        for (index, ready) in origins.iter().enumerate() {
+            let label = if index == 0 { "ready" } else { "" };
+            let interface = ready.interface.as_deref().map_or(String::new(), |name| {
+                format!(
+                    "{}  {}",
+                    " ".repeat(width - ready.origin.len()),
+                    self.paint(Style::new().dimmed(), name)
+                )
+            });
+            crate::note!(
+                "  {}  {}{interface}",
+                self.paint(Color::Green.bold(), &format!("{label:<5}")),
+                self.paint(Color::Cyan.bold(), &ready.origin)
+            );
+        }
+        if listener.ip().is_loopback() {
+            crate::note!(
+                "         {}",
+                self.paint(Style::new().dimmed(), "use --host to expose on the network")
+            );
+        }
     }
 
     fn log(&self, line: &str) {
@@ -333,7 +355,7 @@ impl ShutdownSignals {
 pub fn print_help() -> anyhow::Result<()> {
     crate::cli_output::Output::new(crate::cli_output::Format::Text).help(
         &format!("celld dev — run an application with persistent local storage\n\n\
-USAGE:\n  celld dev [PROJECT] [--host IP] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
+USAGE:\n  celld dev [PROJECT] [--host [IP]] [--port PORT] [--logs] [--no-watch] [--clean]\n\n\
 PROJECT is a directory or a Wrangler config. It defaults to the current\n\
 directory. celld stores all local state in PROJECT/.celld/dev, and it keeps\n\
 that state across a restart. A configuration change does not migrate the\n\
@@ -341,7 +363,7 @@ state, so a cell can keep a value that the new configuration rejects. Use\n\
 --clean to start from an empty local state.\n\n\
 A .dev.vars file beside the config supplies Worker variables in dotenv form,\n\
 as for wrangler dev. Its entries override the vars of the config.\n\n\
-OPTIONS:\n  --host IP              Worker listener host (default: 127.0.0.1)\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
+OPTIONS:\n  --host [IP]            Worker listener host (default: 127.0.0.1); bare\n                         --host listens on all interfaces\n  --port PORT            Worker listener port (default: {DEFAULT_PORT})\n  --clean                Delete PROJECT/.celld/dev before the server starts\n  --logs                 Show the node warning and information logs\n  --no-watch             Do not rebuild when a project file changes\n  --watch-ignore PATTERN Ignore a project-relative glob; repeat as needed\n  -h, --help             Show this help"
         ),
     )
 }
@@ -354,7 +376,7 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
     let mut logs = false;
     let mut watch = true;
     let mut watch_ignores = Vec::new();
-    let mut arguments = arguments.into_iter();
+    let mut arguments = arguments.into_iter().peekable();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--help" | "-h" => return Ok(None),
@@ -370,8 +392,20 @@ fn options_from_arguments(arguments: Vec<String>) -> anyhow::Result<Option<Optio
                         .with_context(|| format!("invalid --watch-ignore pattern {value:?}"))?,
                 );
             }
+            // A bare --host exposes every interface, as with `vite --host`. It
+            // takes the next argument only when that is an address, so a
+            // following PROJECT or option keeps its meaning.
             "--host" => {
-                let value = arguments.next().context("--host requires a value")?;
+                host = match arguments.peek().and_then(|value| value.parse().ok()) {
+                    Some(address) => {
+                        arguments.next();
+                        address
+                    }
+                    None => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                };
+            }
+            other if other.starts_with("--host=") => {
+                let value = &other["--host=".len()..];
                 host = value
                     .parse::<IpAddr>()
                     .with_context(|| format!("invalid --host value {value:?}"))?;
@@ -736,12 +770,86 @@ async fn start_node(
         let _ = output.await;
         return Err(error);
     }
-    console.ready(&format!("http://{listener}"));
+    console.ready(listener);
     Ok(RunningNode {
         child,
         internal,
         output,
     })
+}
+
+/// One origin that `celld dev` names once the node answers, with the network
+/// interface that carries it when the address is not loopback.
+#[derive(Debug, PartialEq, Eq)]
+struct ReadyOrigin {
+    origin: String,
+    interface: Option<String>,
+}
+
+/// The origins a developer can open. A wildcard listener has no address of its
+/// own to print, so it lists loopback and then every IPv4 interface address,
+/// as Vite and Wrangler do. IPv6 addresses are left out because most are
+/// link-local or temporary and a phone rarely reaches them.
+fn ready_origins(listener: SocketAddr, interfaces: &[(String, IpAddr)]) -> Vec<ReadyOrigin> {
+    let interface = |address: IpAddr| {
+        interfaces
+            .iter()
+            .find(|(_, candidate)| *candidate == address)
+            .map(|(name, _)| name.clone())
+    };
+    if !listener.ip().is_unspecified() {
+        return vec![ReadyOrigin {
+            origin: format!("http://{listener}"),
+            interface: interface(listener.ip()).filter(|_| !listener.ip().is_loopback()),
+        }];
+    }
+    let port = listener.port();
+    let loopback = ReadyOrigin {
+        origin: format!("http://{}", SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
+        interface: None,
+    };
+    let network = interfaces
+        .iter()
+        .filter_map(|(name, address)| match address {
+            IpAddr::V4(address) if !address.is_loopback() => Some(ReadyOrigin {
+                origin: format!("http://{}", SocketAddr::from((*address, port))),
+                interface: Some(name.clone()),
+            }),
+            _ => None,
+        });
+    std::iter::once(loopback).chain(network).collect()
+}
+
+/// The addresses of the interfaces that are up and running, in the order the
+/// host reports them. A failed lookup answers nothing, because the listing is
+/// a convenience and the loopback origin is always printed.
+#[cfg(unix)]
+fn interface_addresses() -> Vec<(String, IpAddr)> {
+    use nix::net::if_::InterfaceFlags;
+    let Ok(addresses) = nix::ifaddrs::getifaddrs() else {
+        return Vec::new();
+    };
+    addresses
+        .filter(|entry| {
+            entry
+                .flags
+                .contains(InterfaceFlags::IFF_UP | InterfaceFlags::IFF_RUNNING)
+        })
+        .filter_map(|entry| {
+            let address = entry.address?;
+            let address = if let Some(v4) = address.as_sockaddr_in() {
+                IpAddr::V4(v4.ip())
+            } else {
+                IpAddr::V6(address.as_sockaddr_in6()?.ip())
+            };
+            Some((entry.interface_name, address))
+        })
+        .collect()
+}
+
+#[cfg(not(unix))]
+fn interface_addresses() -> Vec<(String, IpAddr)> {
+    Vec::new()
 }
 
 fn internal_origin(line: &str) -> Option<String> {
@@ -843,5 +951,114 @@ async fn stop_child(child: &mut Child, internal: Option<&str>) {
     let waited = tokio::time::timeout(Duration::from_secs(35), child.wait()).await;
     if waited.is_err() {
         let _ = child.kill().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(arguments: &[&str]) -> anyhow::Result<Options> {
+        let arguments = arguments
+            .iter()
+            .map(|argument| argument.to_string())
+            .collect();
+        Ok(options_from_arguments(arguments)?.unwrap())
+    }
+
+    fn listener(arguments: &[&str]) -> SocketAddr {
+        options(arguments).unwrap().stack.listener
+    }
+
+    fn at(ip: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::from((ip, port))
+    }
+
+    #[test]
+    fn host_defaults_to_loopback_and_takes_an_address() {
+        assert_eq!(listener(&[]), at([127, 0, 0, 1], DEFAULT_PORT));
+        assert_eq!(
+            listener(&["--host", "192.168.1.5"]),
+            at([192, 168, 1, 5], DEFAULT_PORT)
+        );
+        assert_eq!(
+            listener(&["--host=10.0.0.2"]),
+            at([10, 0, 0, 2], DEFAULT_PORT)
+        );
+        assert!(options(&["--host=nope"]).is_err());
+    }
+
+    #[test]
+    fn bare_host_listens_on_all_interfaces() {
+        assert_eq!(listener(&["--host"]), at([0, 0, 0, 0], DEFAULT_PORT));
+        assert_eq!(
+            listener(&["--host", "--port", "8000"]),
+            at([0, 0, 0, 0], 8000)
+        );
+        // A value that is not an address stays the PROJECT, as with `vite --host`.
+        let options = options(&["--host", "./app"]).unwrap();
+        assert_eq!(options.stack.listener, at([0, 0, 0, 0], DEFAULT_PORT));
+        assert_eq!(options.project, Some(PathBuf::from("./app")));
+    }
+
+    fn interfaces() -> Vec<(String, IpAddr)> {
+        [
+            ("lo0", "127.0.0.1"),
+            ("lo0", "::1"),
+            ("en0", "192.168.1.23"),
+            ("en0", "fe80::1"),
+            ("utun4", "100.84.2.7"),
+        ]
+        .into_iter()
+        .map(|(name, address)| (name.to_string(), address.parse().unwrap()))
+        .collect()
+    }
+
+    fn origins(
+        listener: SocketAddr,
+        interfaces: &[(String, IpAddr)],
+    ) -> Vec<(String, Option<String>)> {
+        ready_origins(listener, interfaces)
+            .into_iter()
+            .map(|ready| (ready.origin, ready.interface))
+            .collect()
+    }
+
+    #[test]
+    fn a_specific_listener_is_ready_on_its_own_address() {
+        assert_eq!(
+            origins(at([127, 0, 0, 1], 9876), &interfaces()),
+            vec![("http://127.0.0.1:9876".into(), None)]
+        );
+        assert_eq!(
+            origins(at([192, 168, 1, 23], 9876), &interfaces()),
+            vec![("http://192.168.1.23:9876".into(), Some("en0".into()))]
+        );
+    }
+
+    #[test]
+    fn a_wildcard_listener_is_ready_on_loopback_then_each_ipv4_interface() {
+        let expected: Vec<(String, Option<String>)> = vec![
+            ("http://127.0.0.1:9876".into(), None),
+            ("http://192.168.1.23:9876".into(), Some("en0".into())),
+            ("http://100.84.2.7:9876".into(), Some("utun4".into())),
+        ];
+        assert_eq!(origins(at([0, 0, 0, 0], 9876), &interfaces()), expected);
+        // `::` is dual-stack on the platforms celld dev supports.
+        let dual = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 9876);
+        assert_eq!(origins(dual, &interfaces()), expected);
+        // The readiness probe uses loopback, so that origin is always listed.
+        assert_eq!(
+            origins(at([0, 0, 0, 0], 9876), &[]),
+            vec![("http://127.0.0.1:9876".into(), None)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_host_reports_its_loopback_interface() {
+        assert!(interface_addresses()
+            .iter()
+            .any(|(_, address)| address.is_loopback()));
     }
 }
