@@ -3271,6 +3271,24 @@ __celld.__makeLoader = () => {
       limitsJson: JSON.stringify(options?.limits ?? null),
     };
   };
+  // Hand a loaded Worker's invocation report to its tail Workers.
+  const __deliverTails = (tails, report) => {
+    const delivery = report
+      .then((report) => JSON.parse(report))
+      .then((events) => Promise.allSettled(
+        tails.map((tail) => tail.tail(events))))
+      .then((results) => {
+        for (const result of results) {
+          if (result.status === "rejected")
+            console.error("Tail Worker failed:", result.reason);
+        }
+      })
+      .catch((error) => console.error("Tail delivery failed:", error));
+    // The loaded call answers before its report because the child can
+    // still have waitUntil work. Keep this chain on the loader event so
+    // its IoContext cannot retire and abort the report operation.
+    __registerWaitUntil(delivery);
+  };
   const makeEntrypoint = (loadPromise, entrypoint, propsSc, limitsJson) => {
     const target = {
       async fetch(input, init) {
@@ -3286,23 +3304,7 @@ __celld.__makeLoader = () => {
           propsSc === undefined ? new Uint8Array() : propsSc,
           limitsJson, tails.length !== 0);
         const response = tails.length === 0 ? loaded : loaded[0];
-        if (tails.length !== 0) {
-          const delivery = loaded[1]
-            .then((report) => JSON.parse(report))
-            .then((events) => Promise.allSettled(
-              tails.map((tail) => tail.tail(events))))
-            .then((results) => {
-              for (const result of results) {
-                if (result.status === "rejected")
-                  console.error("Tail Worker failed:", result.reason);
-              }
-            })
-            .catch((error) => console.error("Tail delivery failed:", error));
-          // The loaded fetch answers before its report because the child can
-          // still have waitUntil work. Keep this chain on the loader event so
-          // its IoContext cannot retire and abort the report operation.
-          __registerWaitUntil(delivery);
-        }
+        if (tails.length !== 0) __deliverTails(tails, loaded[1]);
         const r = JSON.parse(await response);
         const responseBody = r.streamId !== undefined
           ? new CelldHttpBodyStream(r.streamId)
@@ -3325,10 +3327,12 @@ __celld.__makeLoader = () => {
           throw new Error(
             "Pipelined property paths on loaded workers are not supported " +
             "yet.");
-        const { id } = await loadPromise;
-        return __rpcDes(
-          await __loader_rpc(id, entrypoint, path[0], __rpcOut(args, true),
-            propsSc, limitsJson));
+        const { id, tails } = await loadPromise;
+        const loaded = __loader_rpc(id, entrypoint, path[0],
+          __rpcOut(args, true), propsSc, limitsJson, tails.length !== 0);
+        if (tails.length === 0) return __rpcDes(await loaded);
+        __deliverTails(tails, loaded[1]);
+        return __rpcDes(await loaded[0]);
       })(),
     };
     return new Proxy(target, {
