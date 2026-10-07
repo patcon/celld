@@ -25,6 +25,16 @@ celld needs four properties from the object store:
 - Ranged reads: a read must return the requested byte range and the bytes
   from that range.
 
+Epoch GC (`CELLD_LTX_RETENTION_SECS`) needs a fifth property:
+
+- List-after-write consistency: a listing after a successful write must
+  include the written object.
+
+Amazon S3, Cloudflare R2, Google Cloud Storage, and Azure Blob Storage
+provide it. A Tigris Global or Dual-region bucket provides it only in the
+region of the write. An operator must not enable epoch GC on such a
+bucket when the nodes of a fleet are in more than one region.
+
 The qualified stores are Amazon S3, Cloudflare R2, Tigris, Google Cloud
 Storage, and Azure Blob Storage. celld's release tests run against R2,
 and the S3 path uses the same client and the same headers.
@@ -216,6 +226,50 @@ uploads their retained segments and bundles into the per-cell prefixes,
 and then marks the record sealed. The activation cannot restore until
 this sequence completes.
 
+A cell can stop while its node session stays open. If acknowledged writes
+remain outside its per-cell prefix, its next activation gathers that tail.
+The log epoch becomes active before its first fleet proof. An active epoch
+requires at least one current follower to return its complete retained range.
+A fleet acknowledgement requires every ensemble member to store the write,
+so one complete follower tail can provide the recovery evidence. If no
+follower proves completeness, the activation fails and keeps the recovery
+requirement. An inactive epoch has issued no fleet proof, so its bucket
+bundles can provide the recovery data. When a stopped cell has a recorded
+recovery requirement, the node keeps the log epoch until a bucket proof
+covers its acknowledged data. A staged upload can complete after the cell
+stops, so its bucket proof permits an ensemble change without another
+activation. The next activation still folds any tail outside the per-cell
+prefix.
+
+A follower restart retains evidence of a damaged batch or a gap before a
+later batch. The follower cannot certify the affected range until valid data
+covers the gap. A directory read error fails the request and permits a retry.
+The error does not become permanent evidence of a gap. A follower's HTTP
+error does not prove that its data is absent, even when its lease has expired.
+When no follower can return a complete tail, persistent response errors
+can block recovery and startup. This check cannot detect a deleted final
+batch if no later batch or persisted end records its range.
+
+A torn batch can contain an unacknowledged write. Recovery cannot distinguish
+that case from damage after an acknowledgement. Therefore, the existing loss
+record can report an uncertified range even when no acknowledged write is
+missing.
+
+The `/peer/log/tail` endpoint selects its response through the request's
+`tail_format` field. A missing field or the value `1` selects the older
+entries-only format, `CLT1`. The value `2` selects the ranged format, `CLT2`,
+and another value fails the request. An older caller gets an HTTP error
+when the follower cannot certify a known fragment, so an incomplete tail
+cannot become a successful entries-only response.
+
+New nodes request the ranged format and decode both response formats. An
+entries-only response provides no range evidence, so recovery treats that
+response as inconclusive. It proves neither completeness nor data loss.
+A recovery that requires a follower witness waits until a current member
+returns the necessary range evidence. Therefore, response compatibility does
+not guarantee uninterrupted recovery or startup during a mixed-version update.
+Old nodes retain their existing recovery checks.
+
 A restarting node serves authenticated follower seal and tail requests before
 it completes its own predecessor recovery. Therefore, nodes that restart
 together can recover acknowledged writes from their surviving follower disks.
@@ -246,6 +300,31 @@ from the cut onward. A link must end exactly at its successor's cut, so an
 epoch that does not continue the chain is not part of it. celld no longer
 writes an epoch seal object, and a legacy `e<epoch>.seal.json` object does
 not limit the chain.
+
+### Epoch GC
+
+When `CELLD_LTX_RETENTION_SECS` has a positive value on a fleet node, the
+owner of a cell deletes the epoch prefixes that no restore reads. The
+owner builds the restore chain over every epoch prefix of the cell,
+including its own. It continues only
+when the newest epoch of the chain is its own epoch. Then its own first
+object is in the listing, so a node that takes the cell over later also
+lists that object and restores from a base at the same epoch or higher.
+A paged cell also waits until its local file is complete, because until
+then it reads pages from the objects of the chain that it restored. Next,
+the owner reads the ownership record and continues only when the record
+names this node at this epoch. It writes `retired.json` with the
+base, and then it deletes the prefixes below the base. It keeps its own
+epoch, the epoch before it, and each epoch younger than the configured
+time.
+
+The order of these steps protects the data. If the owner reads the
+ownership record before its own first object is in the listing, a fenced
+owner can delete the base of the node that took the cell over. A
+conditional write to the ownership record does not add protection,
+because the cell can move between any check and the delete. The late
+delete is safe because an epoch below the base never becomes part of a
+chain again. This argument needs list-after-write consistency.
 
 A fenced node can append an unacknowledged tail to an older prefix. When
 a successor opened with a whole-database snapshot, a later restore reads

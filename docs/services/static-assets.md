@@ -52,8 +52,8 @@ A request meets the asset layer before it meets the Worker. celld considers only
 a `GET` or a `HEAD` request for an asset, and it sends every other method to the
 Worker. `run_worker_first` reverses the order. It takes `true`, or a list of up
 to 100 route patterns in which a `!` prefix excludes a path, and a match sends
-the request to the Worker with no asset lookup. Cloudflare describes the same
-control in its
+the request to the Worker with no asset lookup. The exact `/` pattern sends only
+the root path to the Worker. Cloudflare describes the same control in its
 [Worker script routing documentation](https://developers.cloudflare.com/workers/static-assets/routing/worker-script/).
 
 ![The routing decision for one request: the method test, run_worker_first, the _redirects rules, the html_handling lookup, the pointer re-read after a miss, not_found_handling, and the fall through to the Worker](static-assets-flow.svg)
@@ -133,8 +133,15 @@ applies `not_found_handling`, so a Worker can render a fallback page itself.
   and reads no `If-Modified-Since` header.
 - A `_headers` file cannot change `connection`, `content-length`, or
   `transfer-encoding`.
-- A deployment can contain 20,000 assets, 25 MiB for each asset, and 1 GiB in
-  total. Each `_headers` or `_redirects` file has a 100 KiB limit.
+- A deployment can contain 20,000 assets and 1 GiB in total. The per-file
+  default is 25 MiB; set `CELLD_MAX_ASSET_FILE_BYTES` to a positive byte count
+  consistently on the deployment builder, managed deployment agent, and serving
+  nodes to change it. The per-file limit stays fixed after its first use, so
+  restart the process to apply a new value. When a file exceeds this limit,
+  the deployment builder, the managed agent, and the serving node report its
+  path, its size, and the limit.
+  The total deployment bound still applies. Each `_headers` or `_redirects`
+  file has a 100 KiB limit.
 - `celld deploy` accepts only `directory`, `binding`, `html_handling`,
   `not_found_handling`, and `run_worker_first` in the `assets` block.
 - `celld deploy` refuses a `.assetsignore` file, and it stops the deployment
